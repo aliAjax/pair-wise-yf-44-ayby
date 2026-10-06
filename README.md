@@ -25,6 +25,18 @@ python3 app.py --db ./data.db --port 8310
 ## 核心对象
 
 - `unit`：装置运行状态；`change`：变更申请；`action_item`：风险控制行动项。
+- `window`：装置停车窗口（含容量）；`schedule`：变更对窗口的占用记录，状态为 `scheduled` 或 `queued`。
+
+## 停车排程账
+
+变更批准后可通过 `schedule` 动作排入装置窗口：`POST /api/entities/<change_id>/actions`，请求体 `{"action":"schedule","data":{"window_id":"..."}}`。
+
+- 每张变更占用窗口一个容量；窗口容量满时新申请进入 `queued` 排队，排程账可通过 `GET /api/schedules` 查看。
+- 排程写入失败后，`POST /api/recover` 按申请顺序恢复排队记录；已占位的排程不重复占位（重试幂等）。
+- 同一变更重复排程返回冲突；携带 `idempotency_key` 的重试不占位。
+- 变更实施（`implement`）前，其下所有行动项必须复核通过；任一行动项 `reopen` 后，已开始的实施退回 `approved` 并标记重新评估。
+- 风险等级变更时，未复核的行动项作废并重算措施；已投产（`commissioned`）的变更保留原记录。
+- 升级时旧数据缺少落实状态，`POST /api/backfill` 按已有复核记录回填 `implementation_status`，历史变更仍可正常读取。
 
 ## 主要接口
 

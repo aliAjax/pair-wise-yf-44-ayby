@@ -2,11 +2,15 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def utcnow_micro():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class SQLiteRepository:
@@ -86,6 +90,54 @@ class SQLiteRepository:
                 "SELECT * FROM entities WHERE id = ?", (entity_id,)
             ).fetchone()
         return self._entity_from_row(row) if row else None
+
+    def delete_entity(self, entity_id):
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM entities WHERE id = ?", (entity_id,)
+            )
+
+    def claim_window_slot(self, window_id):
+        """Atomically claim one slot in a shutdown window.
+
+        Uses BEGIN IMMEDIATE so concurrent schedulers serialize on the write
+        lock: the late caller waits, then observes the updated count and either
+        gets a slot or finds the window full. Returns the updated window, or
+        None when the window is at capacity.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (window_id,)
+            ).fetchone()
+            if not row:
+                connection.rollback()
+                raise NotFoundError("window not found: " + window_id)
+            window = self._entity_from_row(row)
+            if window["kind"] != "window":
+                connection.rollback()
+                raise ValidationError("not a window: " + window_id)
+            data = dict(window["data"])
+            capacity = int(data.get("capacity", 1))
+            scheduled = int(data.get("scheduled_count", 0))
+            if scheduled >= capacity:
+                connection.rollback()
+                return None
+            data["scheduled_count"] = scheduled + 1
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ?",
+                (payload, utcnow(), window_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(window_id)
 
     def list_entities(self, kind=None, status=None):
         clauses = []

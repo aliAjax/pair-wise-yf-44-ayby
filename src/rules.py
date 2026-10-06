@@ -16,6 +16,25 @@ def _validate_change(actor, data, lookup):
         raise ValidationError("change description is required")
 
 
+def _validate_window(actor, data, lookup):
+    unit = _find_one(lookup, "unit", "id", data.get("unit_id"))
+    if not unit:
+        raise ValidationError("unit does not exist")
+    start = data.get("start")
+    end = data.get("end")
+    if not start or not end:
+        raise ValidationError("window start and end are required")
+    if str(start) >= str(end):
+        raise ValidationError("window start must be before end")
+    capacity = data.get("capacity", 1)
+    try:
+        capacity = int(capacity)
+    except (TypeError, ValueError):
+        raise ValidationError("window capacity must be an integer")
+    if capacity < 1:
+        raise ValidationError("window capacity must be at least 1")
+
+
 def required_approval_level(risk_level):
     levels = {"low": 1, "medium": 2, "high": 3, "critical": 4}
     return levels.get(str(risk_level).lower(), 4)
@@ -33,25 +52,47 @@ def _validate_approve(actor, entity, data, lookup):
     return {"approved_by": actor.user_id}
 
 
-def _validate_commission(actor, entity, data, lookup):
-    items = lookup("action_item", "change_id", entity["id"]) or [] if lookup else []
-    unresolved = [item["id"] for item in items if item["status"] != "verified"]
+def _unverified_items(entity, lookup):
+    items = lookup("action_item", "change_id", entity["id"]) or []
+    return [item for item in items if item["status"] != "verified"]
+
+
+def _validate_implement(actor, entity, data, lookup):
+    unresolved = _unverified_items(entity, lookup)
     if unresolved:
-        raise ValidationError("unresolved action items: " + ", ".join(unresolved))
+        raise ValidationError(
+            "all action items must be verified before implement: "
+            + ", ".join(item["id"] for item in unresolved)
+        )
+    return {}
+
+
+def _validate_commission(actor, entity, data, lookup):
+    unresolved = _unverified_items(entity, lookup)
+    if unresolved:
+        raise ValidationError(
+            "unresolved action items: "
+            + ", ".join(item["id"] for item in unresolved)
+        )
     return {"commissioned_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'change': _validate_change}
-CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission}
+CUSTOM_CREATE = {'change': _validate_change, 'window': _validate_window}
+CUSTOM_TRANSITIONS = {
+    ('change', 'assess'): _validate_assess,
+    ('change', 'approve'): _validate_approve,
+    ('change', 'implement'): _validate_implement,
+    ('change', 'commission'): _validate_commission,
+}
 
 
 class RuleEngine:
-    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item'}
-    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open'}
-    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}}
-    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner')}
-    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',)}
-    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety')}
+    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item', 'windows': 'window', 'schedules': 'schedule'}
+    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open', 'window': 'open', 'schedule': 'scheduled'}
+    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft', 'assessed', 'approved', 'implemented', 'commissioned'), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}, 'window': {'close': (('open',), 'closed')}}
+    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner'), 'window': ('unit_id', 'start', 'end')}
+    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',), ('window', 'close'): ('reason',)}
+    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety'), 'window': ('admin', 'engineer')}
     ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier')}
 
     def normalize_kind(self, kind):

@@ -138,6 +138,10 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "recover"]:
+                    return self._send(200, service.recover_schedule(actor))
+                if parts == ["api", "backfill"]:
+                    return self._send(200, service.backfill(actor))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
