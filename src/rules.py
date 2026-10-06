@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from .domain import (
     ConflictError,
@@ -6,6 +6,53 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+
+# 风险等级 -> 至少需要的独立审批人数
+def required_approval_level(risk_level):
+    levels = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+    return levels.get(str(risk_level).lower(), 4)
+
+
+# 风险等级 -> 必须落实的风险控制措施（重算措施的基准）
+RISK_MEASURES = {
+    "low": ["site_briefing"],
+    "medium": ["site_briefing", "work_permit"],
+    "high": ["site_briefing", "work_permit", "dual_verification"],
+    "critical": [
+        "site_briefing",
+        "work_permit",
+        "dual_verification",
+        "escalated_approval",
+        "special_plan",
+    ],
+}
+
+MEASURE_NAMES = {
+    "site_briefing": "现场交底",
+    "work_permit": "作业许可",
+    "dual_verification": "双人复核",
+    "escalated_approval": "升级审批",
+    "special_plan": "专项应急预案",
+}
+
+
+def required_measures(risk_level):
+    return list(RISK_MEASURES.get(str(risk_level).lower(), RISK_MEASURES["critical"]))
+
+
+def _parse_dt(value, field):
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise ValidationError("invalid ISO datetime for %s: %s" % (field, value))
+
+
+def _find_one(lookup, kind, field, value):
+    if lookup is None:
+        return None
+    rows = lookup(kind, field, value) or []
+    return rows[0] if rows else None
 
 
 def _validate_change(actor, data, lookup):
@@ -16,13 +63,34 @@ def _validate_change(actor, data, lookup):
         raise ValidationError("change description is required")
 
 
-def required_approval_level(risk_level):
-    levels = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-    return levels.get(str(risk_level).lower(), 4)
+def _validate_window(actor, data, lookup):
+    unit = _find_one(lookup, "unit", "id", data.get("unit_id"))
+    if not unit:
+        raise ValidationError("unit does not exist")
+    start = _parse_dt(data.get("start"), "start")
+    end = _parse_dt(data.get("end"), "end")
+    if not start < end:
+        raise ValidationError("window start must be before end")
+    capacity = data.get("capacity")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+        raise ValidationError("capacity must be a positive integer")
+
+
+def _risk_patch(data):
+    level = str(data.get("risk_level")).lower()
+    return {
+        "risk_level": level,
+        "required_approvals": required_approval_level(level),
+        "required_measures": required_measures(level),
+    }
 
 
 def _validate_assess(actor, entity, data, lookup):
-    return {"required_approvals": required_approval_level(data.get("risk_level"))}
+    return _risk_patch(data)
+
+
+def _validate_reassess(actor, entity, data, lookup):
+    return _risk_patch(data)
 
 
 def _validate_approve(actor, entity, data, lookup):
@@ -33,26 +101,118 @@ def _validate_approve(actor, entity, data, lookup):
     return {"approved_by": actor.user_id}
 
 
+def _unresolved_items(items):
+    # cancelled 是作废措施，不再阻塞实施；其余必须全部 verified
+    return [item["id"] for item in items if item["status"] not in ("verified", "cancelled")]
+
+
+def _validate_implement(actor, entity, data, lookup):
+    items = lookup("action_item", "change_id", entity["id"]) if lookup else []
+    unresolved = _unresolved_items(items)
+    if unresolved:
+        raise ValidationError("action items not fully verified: " + ", ".join(unresolved))
+    return {"implemented_by": actor.user_id}
+
+
 def _validate_commission(actor, entity, data, lookup):
-    items = lookup("action_item", "change_id", entity["id"]) or [] if lookup else []
-    unresolved = [item["id"] for item in items if item["status"] != "verified"]
+    items = lookup("action_item", "change_id", entity["id"]) if lookup else []
+    unresolved = _unresolved_items(items)
     if unresolved:
         raise ValidationError("unresolved action items: " + ", ".join(unresolved))
     return {"commissioned_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'change': _validate_change}
-CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission}
+CUSTOM_CREATE = {"change": _validate_change, "window": _validate_window}
+CUSTOM_TRANSITIONS = {
+    ("change", "assess"): _validate_assess,
+    ("change", "reassess"): _validate_reassess,
+    ("change", "approve"): _validate_approve,
+    ("change", "implement"): _validate_implement,
+    ("change", "commission"): _validate_commission,
+}
 
 
 class RuleEngine:
-    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item'}
-    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open'}
-    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}}
-    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner')}
-    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',)}
-    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety')}
-    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier')}
+    ALIASES = {
+        "units": "unit",
+        "changes": "change",
+        "action_items": "action_item",
+        "windows": "window",
+        "bookings": "booking",
+    }
+    INITIAL_STATUS = {
+        "unit": "operating",
+        "change": "draft",
+        "action_item": "open",
+        "window": "open",
+    }
+    TRANSITIONS = {
+        "unit": {
+            "shutdown": (("operating",), "shutdown"),
+            "startup": (("shutdown",), "operating"),
+            "freeze": (("operating",), "frozen"),
+            "unfreeze": (("frozen",), "operating"),
+        },
+        "change": {
+            "assess": (("draft",), "assessed"),
+            "reassess": (("assessed", "approved", "commissioned"), "assessed"),
+            "approve": (("assessed",), "approved"),
+            "implement": (("approved",), "implemented"),
+            "commission": (("implemented",), "commissioned"),
+            "rollback": (("implemented", "commissioned"), "rolled_back"),
+            "close": (("rolled_back",), "closed"),
+        },
+        "action_item": {
+            "complete": (("open",), "completed"),
+            "verify": (("completed",), "verified"),
+            "reopen": (("verified",), "open"),
+        },
+        "window": {"close": (("open",), "closed")},
+    }
+    CREATE_REQUIRED = {
+        "unit": ("name", "location"),
+        "change": ("unit_id", "description"),
+        "action_item": ("change_id", "description", "owner"),
+        "window": ("unit_id", "start", "end", "capacity"),
+    }
+    ACTION_REQUIRED = {
+        ("unit", "shutdown"): ("reason",),
+        ("unit", "freeze"): ("reason",),
+        ("change", "assess"): ("risk_level", "analyst"),
+        ("change", "reassess"): ("risk_level", "analyst", "reason"),
+        ("change", "approve"): ("approvals", "permit_id"),
+        ("change", "implement"): ("procedure_version",),
+        ("change", "commission"): ("tests_passed",),
+        ("change", "rollback"): ("reason",),
+        ("change", "close"): ("outcome",),
+        ("action_item", "complete"): ("completed_by", "evidence"),
+        ("action_item", "verify"): ("verifier",),
+        ("action_item", "reopen"): ("reason",),
+        ("window", "close"): ("reason",),
+    }
+    CREATE_ROLES = {
+        "unit": ("admin", "engineer"),
+        "change": ("admin", "engineer"),
+        "action_item": ("admin", "safety"),
+        "window": ("admin", "engineer"),
+    }
+    ROLE_ACTIONS = {
+        "shutdown": ("admin", "operator"),
+        "startup": ("admin", "operator"),
+        "freeze": ("admin", "operator"),
+        "unfreeze": ("admin", "operator"),
+        "assess": ("admin", "engineer"),
+        "reassess": ("admin", "engineer", "safety"),
+        "approve": ("admin", "safety"),
+        "implement": ("admin", "engineer"),
+        "commission": ("admin", "engineer"),
+        "rollback": ("admin", "engineer"),
+        "close": ("admin", "safety"),
+        "complete": ("admin", "engineer"),
+        "verify": ("admin", "verifier"),
+        "reopen": ("admin", "verifier", "safety"),
+        "close_window": ("admin", "operator"),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -107,14 +267,3 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
-
-
-def _find_one(lookup, kind, field, value):
-    if lookup is None:
-        return None
-    rows = lookup(kind, field, value) or []
-    return rows[0] if rows else None
-
-
-def _date_ordinal(value):
-    return datetime.fromisoformat(str(value)[:10]).date().toordinal()

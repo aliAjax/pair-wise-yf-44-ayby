@@ -85,6 +85,8 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[:2] == ["api", "windows"] and parts[3] == "schedule":
+                    return self._send(200, {"items": service.window_schedule(parts[2])})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +140,26 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 4 and parts[:2] == ["api", "windows"] and parts[3] == "bookings":
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key")
+                    booking, state = service.submit_window(actor, parts[2], body, idem)
+                    if state == "scheduled":
+                        code = 201
+                    elif state == "queued":
+                        code = 202
+                    else:
+                        code = 200
+                    return self._send(code, booking)
+                if len(parts) == 4 and parts[:2] == ["api", "windows"] and parts[3] == "recover":
+                    promoted = service.recover_window(actor, parts[2])
+                    return self._send(200, {"promoted": promoted})
+                if len(parts) == 4 and parts[:2] == ["api", "bookings"] and parts[3] == "release":
+                    body = self._body()
+                    released, promoted = service.release_booking(
+                        actor, parts[2], body.get("reason")
+                    )
+                    return self._send(200, {"booking": released, "promoted": promoted})
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
